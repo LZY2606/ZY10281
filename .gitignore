@@ -1,0 +1,76 @@
+build/
+dist/
+downloads/
+example_cache/
+http_cache/
+benchmark_cache/
+scratch
+venv/
+
+*.db
+*.egg
+*.egg-info
+*.py[cod]
+*.sqlite
+*.sqlite-journal
+.venv
+Pipfile
+profile.json
+
+# JS
+node_modules/
+package-lock.json
+package.json
+
+# Editors
+.~*
+.idea/
+.vim/
+.vscode/
+
+# Test / coverage reports
+.coverage
+.coverage.*
+.COVERAGE.*
+.mypy_cache/
+.pytest_cache/
+.nox/
+test-reports/
+
+# Sphinx / Readthedocs
+docs/_build/
+docs/modules/
+docs/requirements.txt
+
+# Project-agnostic
+.cache
+
+# --- 依赖与构建产物（不进交付快照）---
+bower_components/
+.pnp.*
+out/
+target/
+.next/
+.nuxt/
+.svelte-kit/
+.venv/
+env/
+__pycache__/
+*.pyc
+.ruff_cache/
+.tox/
+vendor/bundle/
+Pods/
+.gradle/
+.cargo/
+.DS_Store
+.env
+.env.*
+*.log
+coverage/
+.nyc_output/
+.cache/
+.parcel-cache/
+.vite/
+.turbo/
+*.tsbuildinfo

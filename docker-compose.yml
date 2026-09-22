@@ -1,0 +1,56 @@
+# Containers needed to test all backend services locally
+services:
+  httpbin:
+    image: mccutchen/go-httpbin
+    container_name: httpbin
+    ports:
+      - '8080:8080'
+
+  dynamodb:
+    image: amazon/dynamodb-local
+    container_name: dynamodb-test
+    ports:
+      - '8000:8000'
+    command: '-jar DynamoDBLocal.jar -inMemory'
+    environment:
+      AWS_ACCESS_KEY_ID: 'placeholder'
+      AWS_SECRET_ACCESS_KEY: 'placeholder'
+    working_dir: '/home/dynamodblocal'
+
+  mongo:
+    image: mongo
+    container_name: mongo-test
+    environment:
+      MONGO_INITDB_DATABASE: 'requests_cache_pytest'
+    ports:
+      - '27017:27017'
+    volumes:
+      - 'mongodb_data:/data/db'
+
+  redis:
+    container_name: redis-test
+    image: docker.io/bitnami/redis
+    ports:
+      - '6379:6379'
+    environment:
+      ALLOW_EMPTY_PASSWORD: 'yes'
+    volumes:
+      - 'redis_data:/bitnami/redis/data'
+
+  valkey:
+    image: docker.io/bitnami/valkey:8.0
+    container_name: valkey-test
+    environment:
+      ALLOW_EMPTY_PASSWORD: 'yes'
+    ports:
+      - '6380:6379'
+    volumes:
+      - 'valkey_data:/bitnami/valkey/data'
+
+volumes:
+  mongodb_data:
+    driver: local
+  redis_data:
+    driver: local
+  valkey_data:
+    driver: local
