@@ -77,6 +77,7 @@ class CacheActions(RichMixin):
     _only_if_cached: bool = field(default=False, repr=False)
     _refresh: bool = field(default=False, repr=False)
     _request: PreparedRequest = field(default=None, repr=False)
+    _start_time: Optional[datetime] = field(default=None, repr=False)
     _stale_if_error: Union[bool, ExpirationTime] = field(default=None, repr=False)
     _stale_while_revalidate: Union[bool, ExpirationTime] = field(default=None, repr=False)
     _validation_headers: Dict[str, str] = field(factory=dict, repr=False)
@@ -88,6 +89,7 @@ class CacheActions(RichMixin):
         cache_key: str,
         request: PreparedRequest,
         settings: Optional[CacheSettings] = None,
+        start_time: Optional[datetime] = None,
     ):
         """Initialize from request info and cache settings.
 
@@ -100,6 +102,8 @@ class CacheActions(RichMixin):
             cache_key: The cache key created based on the initial request
             request: The outgoing request
             settings: Session-level cache settings
+            start_time: Time the request attempt started; used as a consistent reference for
+                expiration timestamps. Defaults to the current time.
         """
         settings = settings or CacheSettings()
         directives = CacheDirectives.from_headers(request.headers)
@@ -141,6 +145,7 @@ class CacheActions(RichMixin):
             settings=settings,
             skip_read=any(read_criteria.values()),
             skip_write=directives.no_store,
+            start_time=start_time,
             stale_if_error=stale_if_error,
             stale_while_revalidate=stale_while_revalidate,
         )
@@ -151,7 +156,7 @@ class CacheActions(RichMixin):
         """Convert the user/header-provided expiration value to a datetime. Applies to new cached
         responses, and previously cached responses that are being revalidated.
         """
-        return get_expiration_datetime(self.expire_after)
+        return get_expiration_datetime(self.expire_after, start_time=self._start_time)
 
     def is_usable(self, cached_response: Optional['CachedResponse'], error: bool = False):
         """Determine whether a given cached response is "fresh enough" to satisfy the request,

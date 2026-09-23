@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from abc import ABC
 from collections import UserDict
+from contextlib import contextmanager
 from datetime import datetime
 from logging import getLogger
 from pickle import PickleError
@@ -57,6 +58,20 @@ class BaseCache:
         self.redirects: BaseStorage[str, str] = DictStorage()
         self._settings = CacheSettings()  # Init and public access is done in CachedSession
 
+    #: Whether the backend can group multiple writes into a single atomic transaction
+    supports_transactions: bool = False
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Group multiple cache writes (e.g., a response and its redirect aliases) into a
+        single atomic operation, if the backend supports it.
+
+        Backends that support transactions should override this (and set
+        ``supports_transactions = True``). For all other backends this is a no-op, and
+        writes retain best-effort semantics.
+        """
+        yield
+
     @property
     def db_path(self) -> Union[str, Path]:
         """Path to the cache database file.
@@ -89,6 +104,7 @@ class BaseCache:
         response: Response,
         cache_key: Optional[str] = None,
         expires: Optional[datetime] = None,
+        created_at: Optional[datetime] = None,
     ):
         """Save a response to the cache
 
@@ -96,16 +112,22 @@ class BaseCache:
             cache_key: Cache key for this response; will otherwise be generated based on request
             response: Response to save
             expires: Absolute expiration time for this response
+            created_at: Creation time for this response; defaults to the current time
         """
         cache_key = cache_key or self.create_key(response.request)
-        cached_response = CachedResponse.from_response(response, expires=expires)
+        extra = {'created_at': created_at} if created_at is not None else {}
+        cached_response = CachedResponse.from_response(response, expires=expires, **extra)
         cached_response = redact_response(cached_response, self._settings.ignored_parameters)
-        self.responses[cache_key] = cached_response
 
-        # Save redirect aliases, unless this is a revalidation (i.e., it was saved previously)
-        if response.history and not cached_response.revalidated:
-            for r in response.history:
-                self.redirects[self.create_key(r.request)] = cache_key
+        # Write the response and any redirect aliases as a single atomic operation, if the
+        # backend supports transactions; otherwise writes are best-effort
+        with self.transaction():
+            self.responses[cache_key] = cached_response
+
+            # Save redirect aliases, unless this is a revalidation (i.e., it was saved previously)
+            if response.history and not cached_response.revalidated:
+                for r in response.history:
+                    self.redirects[self.create_key(r.request)] = cache_key
 
     def clear(self):
         """Delete all items from the cache"""

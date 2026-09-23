@@ -2,6 +2,12 @@
 
 ## Unreleased
 * Fix unhandled `EOFError` when a cache value fails to deserialize
+* Refactor request handling into a per-attempt `RequestCachePlan`: the normalized request,
+  cache key, policy snapshot, and clock reading are fixed once per attempt, and network
+  responses are written to the backend in a single commit phase
+* Add `BaseCache.transaction()` so backends with transaction support (currently SQLite) commit
+  a response and its redirect aliases atomically; other backends retain best-effort semantics
+* Fix filesystem backend leaving a truncated cache file when serialization fails
 
 ## 1.3.3 (2026-07-03)
 * Add `CachedResponse.has_content_changed` to flag whether a refresh differs from the cache, when a reliable comparison is available.

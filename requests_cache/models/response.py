@@ -66,7 +66,7 @@ class OriginalResponse(BaseResponse):
             # Add expires and cache_key only if the response was written to the cache
             response.expires = None if actions.skip_write else actions.expires  # type: ignore
             response.cache_key = None if actions.skip_write else actions.cache_key  # type: ignore
-            response.created_at = utcnow()  # type: ignore
+            response.created_at = actions._start_time or utcnow()  # type: ignore
         return response  # type: ignore
 
     def update_content_changed(self, cached_response: Optional['CachedResponse']) -> None:

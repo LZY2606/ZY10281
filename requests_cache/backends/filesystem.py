@@ -145,8 +145,11 @@ class FileDict(BaseStorage):
 
     def __setitem__(self, key, value):
         with self._try_io(key):
+            # Serialize before opening the file so a serialization failure doesn't
+            # leave a truncated (empty) file behind
+            value = self.serialize(value)
             with self._key2path(key).open(mode='wb' if self.is_binary else 'w') as f:
-                f.write(self.serialize(value))
+                f.write(value)
 
     def __contains__(self, key) -> bool:
         with self._lock:

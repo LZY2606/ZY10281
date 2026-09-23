@@ -71,6 +71,33 @@ class SQLiteCache(BaseCache):
     def db_path(self) -> StrOrPath:
         return self.responses.db_path
 
+    supports_transactions = True
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Group multiple writes (e.g., a response and its redirect aliases) into a single
+        SQLite transaction, so a failure mid-commit leaves no partial state.
+        """
+        responses = self.responses
+        if responses._active_transaction:
+            # Already inside a transaction; nothing more to do
+            yield
+            return
+
+        # Both tables live in the same database; route redirect writes through the same
+        # connection so all writes commit (or roll back) together
+        redirects = self.redirects
+        with responses.connection(), responses._acquire_sqlite_lock():
+            prev_connection = redirects._connection
+            prev_active = redirects._active_transaction
+            redirects._connection = responses._connection
+            redirects._active_transaction = True
+            try:
+                yield
+            finally:
+                redirects._connection = prev_connection
+                redirects._active_transaction = prev_active
+
     def clear(self):
         """Delete all items from the cache. If this fails due to a corrupted cache or other I/O
         error, this will  attempt to delete the cache file and re-initialize.
@@ -313,6 +340,11 @@ class SQLiteDict(BaseStorage):
                 self._connection.commit()
             except sqlite3.OperationalError:
                 self._connection.rollback()
+            except BaseException:
+                # Roll back on any other error (e.g., serialization failure) so the
+                # connection isn't left with an open transaction
+                self._connection.rollback()
+                raise
             finally:
                 self._active_transaction = False
 

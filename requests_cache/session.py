@@ -2,7 +2,7 @@
 
 from contextlib import contextmanager, nullcontext
 from logging import getLogger
-from threading import RLock, Thread
+from threading import RLock, Thread, local
 from typing import TYPE_CHECKING, Iterable, MutableMapping, Optional, Union
 
 from requests import PreparedRequest
@@ -23,6 +23,7 @@ from .policy import (
     ExpirationTime,
     FilterCallback,
     KeyCallback,
+    RequestCachePlan,
     set_request_headers,
 )
 from .serializers import SerializerType
@@ -81,6 +82,7 @@ class CacheMixin(MIXIN_BASE):
             **kwargs,
         )
         self._lock = RLock()
+        self._plan_local = local()
 
         # If the mixin superclass is a custom Session, pass along any valid kwargs
         super().__init__(**get_valid_kwargs(super().__init__, kwargs))
@@ -210,101 +212,91 @@ class CacheMixin(MIXIN_BASE):
         6. :py:meth:`requests.Session.send` (if not using a cached response)
         7. :py:meth:`.BaseCache.save_response` (if not using a cached response)
         """
-        # Determine which actions to take based on settings and request info
         request.headers = set_request_headers(
             request.headers, expire_after, only_if_cached, refresh, force_refresh
         )
-        actions = CacheActions.from_request(
-            self.cache.create_key(request, **kwargs), request, self.settings
+
+        # Create a per-attempt cache plan: this fixes the normalized request, cache key, policy
+        # snapshot, and clock reading for this attempt. Attempts spawned by redirects or retries
+        # are explicitly linked to the currently active (parent) plan.
+        plan = RequestCachePlan.from_request(
+            request, self.cache, self.settings, parent=self._active_plan(), **kwargs
         )
+        with self._plan_context(plan):
+            # Attempt to fetch a cached response
+            plan.lookup(self.cache, **kwargs)
+            actions = plan.actions
+            cached_response = plan.cached_response
 
-        # Attempt to fetch a cached response
-        cached_response: Optional[CachedResponse] = None
-        if not actions.skip_read:
-            cached_response = self.cache.get_response(actions.cache_key)
-        actions.update_from_cached_response(cached_response, self.cache.create_key, **kwargs)
+            # Handle missing and expired responses based on settings and headers
+            if actions.error_504:
+                response: AnyResponse = get_504_response(request)
+            elif actions.resend_async:
+                self._resend_async(request, plan, cached_response, **kwargs)
+                response = cached_response  # type: ignore
+            elif actions.resend_request:
+                response = self._resend(request, plan, cached_response, **kwargs)  # type: ignore
+                if isinstance(response, OriginalResponse) and actions._vary_matched:
+                    response.update_content_changed(cached_response)
+            elif actions.send_request:
+                response = self._send_and_cache(request, plan, cached_response, **kwargs)
+            else:
+                response = cached_response  # type: ignore  # Guaranteed to be non-None by this point
 
-        # Secondary Vary lookup: if the primary entry didn't match on Vary,
-        # try a Vary-qualified key before going to the origin server.
-        if actions.vary_cache_key:
-            vary_key = actions.vary_cache_key
-            vary_cached = self.cache.get_response(vary_key)
-            # Use the Vary-qualified key for any future storage (hit or miss)
-            actions.cache_key = vary_key
-            if vary_cached is not None:
-                # Reset decision flags from the failed primary Vary check
-                actions.send_request = False
-                actions.resend_request = False
-                actions.resend_async = False
-                actions.error_504 = False
-                actions.vary_cache_key = None
-                actions._validation_headers = {}
-                # Re-evaluate freshness/expiry with the Vary-matched response
-                actions.update_from_cached_response(vary_cached, self.cache.create_key, **kwargs)
-                cached_response = vary_cached
+            # If the request has been filtered out and was previously cached, delete it
+            if self.settings.filter_fn is not None and not self.settings.filter_fn(response):
+                logger.debug(f'Deleting filtered response for URL: {response.url}')
+                self.cache.delete(actions.cache_key)
+                return response
 
-        # Handle missing and expired responses based on settings and headers
-        if actions.error_504:
-            response: AnyResponse = get_504_response(request)
-        elif actions.resend_async:
-            self._resend_async(request, actions, cached_response, **kwargs)
-            response = cached_response  # type: ignore
-        elif actions.resend_request:
-            response = self._resend(request, actions, cached_response, **kwargs)  # type: ignore
-            if isinstance(response, OriginalResponse) and actions._vary_matched:
-                response.update_content_changed(cached_response)
-        elif actions.send_request:
-            response = self._send_and_cache(request, actions, cached_response, **kwargs)
-        else:
-            response = cached_response  # type: ignore  # Guaranteed to be non-None by this point
+            # Dispatch any hooks here, because they are removed during serialization
+            return dispatch_hook('response', request.hooks, response, **kwargs)
 
-        # If the request has been filtered out and was previously cached, delete it
-        if self.settings.filter_fn is not None and not self.settings.filter_fn(response):
-            logger.debug(f'Deleting filtered response for URL: {response.url}')
-            self.cache.delete(actions.cache_key)
-            return response
+    def _active_plan(self) -> Optional[RequestCachePlan]:
+        """The plan for the request attempt currently in progress on this thread, if any"""
+        plans = getattr(self._plan_local, 'plans', None)
+        return plans[-1] if plans else None
 
-        # Dispatch any hooks here, because they are removed during serialization
-        return dispatch_hook('response', request.hooks, response, **kwargs)
+    @contextmanager
+    def _plan_context(self, plan: RequestCachePlan):
+        """Mark a plan as active for the duration of its attempt, so that any nested attempts
+        (e.g., redirects) are linked to it as children.
+        """
+        plans = getattr(self._plan_local, 'plans', None)
+        if plans is None:
+            plans = self._plan_local.plans = []
+        plans.append(plan)
+        try:
+            yield
+        finally:
+            plans.pop()
 
     def _send_and_cache(
         self,
         request: PreparedRequest,
-        actions: CacheActions,
+        actions: Union[CacheActions, RequestCachePlan],
         cached_response: Optional[CachedResponse] = None,
         **kwargs,
     ) -> AnyResponse:
         """Send a request and cache the response, unless disabled by settings or headers.
         If applicable, also handle conditional requests.
+
+        Accepts either a :py:class:`.RequestCachePlan` (normal flow) or a bare
+        :py:class:`.CacheActions`, which is wrapped in a plan.
         """
-        request = actions.update_request(request)
+        plan = (
+            actions
+            if isinstance(actions, RequestCachePlan)
+            else RequestCachePlan.from_actions(actions, request)
+        )
+        request = plan.actions.update_request(request)
         response = super().send(request, **kwargs)
-        actions.update_from_response(response)
-
-        if not actions.skip_write:
-            self.cache.save_response(response, actions.cache_key, actions.expires)
-        elif cached_response is not None and response.status_code == 304:
-            cached_response = actions.update_revalidated_response(
-                response, CachedResponse.from_response(cached_response)
-            )
-            cached_response.cache_key = actions.cache_key
-            if not actions.skip_write:
-                self.cache.save_response(cached_response, actions.cache_key, actions.expires)  # type: ignore[unreachable]
-            return cached_response
-        else:
-            logger.debug(f'Skipping cache write for URL: {request.url}')
-
-        # This is possible if the original request is a cache miss, but updating its validation
-        # headers results in redirecting to a different URL that is a cache hit
-        if isinstance(response, CachedResponse):
-            return response
-        else:
-            return OriginalResponse.wrap_response(response, actions)
+        return plan.commit(self.cache, response, cached_response)
 
     def _resend(
         self,
         request: PreparedRequest,
-        actions: CacheActions,
+        plan: RequestCachePlan,
         cached_response: CachedResponse,
         **kwargs,
     ) -> AnyResponse:
@@ -313,7 +305,7 @@ class CacheMixin(MIXIN_BASE):
         """
         logger.debug('Stale response; attempting to re-send request')
         try:
-            response = self._send_and_cache(request, actions, cached_response, **kwargs)
+            response = self._send_and_cache(request, plan, cached_response, **kwargs)
             if (
                 self.settings.stale_if_error
                 and response.status_code not in self.settings.allowable_codes
@@ -321,7 +313,7 @@ class CacheMixin(MIXIN_BASE):
                 response.raise_for_status()
             return response
         except Exception:
-            return self._handle_error(cached_response, actions)
+            return self._handle_error(cached_response, plan.actions)
 
     def _resend_async(self, *args, **kwargs):
         """Send a non-blocking request to refresh a cached response"""
